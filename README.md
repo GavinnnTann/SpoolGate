@@ -227,3 +227,8 @@ this as an interim workaround pursued *alongside* that request, not instead of i
 
 `esp32` `esp32-s3` `nat-router` `wifi-repeater` `bambu-lab` `3d-printing` `platformio`
 `arduino` `napt` `wpa2-enterprise` `802-1x` `eduroam` `softap` `iot`
+
+## License
+
+[MIT](LICENSE) © Gavin Tan. Not affiliated with or endorsed by Bambu Lab; product
+names are trademarks of their respective owners.
