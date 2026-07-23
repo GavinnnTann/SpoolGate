@@ -10,12 +10,6 @@ router. SpoolGate joins the restricted network as a client and re-broadcasts its
 clean private Wi-Fi for the printer, NAT-routing traffic between the two, and is
 configured through a built-in router-style **web admin portal**.
 
-**Keywords:** ESP32 NAT router · Bambu Lab A1 / A1 Mini / P1P / P1S / X1C · enterprise
-Wi-Fi · WPA2-Enterprise · 802.1X · eduroam · campus / university / office Wi-Fi ·
-client isolation · AP isolation · mDNS blocked · Bambu cloud offline · Bambu Handy
-can't find printer · LAN mode · SoftAP · NAPT · web admin portal · Arduino ·
-PlatformIO · ESP32-S3-DevKitC-1
-
 ---
 
 ## Does this describe your problem?
@@ -222,11 +216,6 @@ these. Only run this on a network you're authorised to use, keep the SSID unrema
 and the radio power modest, and understand your institution's acceptable-use policy.
 The clean long-term fix is to ask IT to place the printer's MAC on an IoT VLAN; treat
 this as an interim workaround pursued *alongside* that request, not instead of it.
-
-## Suggested GitHub topics
-
-`esp32` `esp32-s3` `nat-router` `wifi-repeater` `bambu-lab` `3d-printing` `platformio`
-`arduino` `napt` `wpa2-enterprise` `802-1x` `eduroam` `softap` `iot`
 
 ## License
 
