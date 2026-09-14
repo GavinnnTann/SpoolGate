@@ -6,6 +6,7 @@
 #include <esp_random.h>
 
 #include "../config.h"
+#include "../logbuf.h"
 #include "../net/napt.h"
 #include "../watchdog.h"
 
@@ -58,6 +59,9 @@ const char kCss[] =
   "border-bottom:1px solid #1c212b;font-size:13px}"
   ".kv span{color:#8b93a1}.kv b{font-weight:600;text-align:right;word-break:break-all}"
   ".up{color:#86efac}.down{color:#fca5a5}"
+  "pre.log{background:#0a0c10;border:1px solid #2a2f3a;border-radius:8px;padding:12px;"
+  "font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;color:#c7ccd6;"
+  "white-space:pre-wrap;word-break:break-word;max-height:62vh;overflow-y:auto;margin:0}"
   "</style>";
 
 String htmlEscape(const String &in) {
@@ -364,6 +368,7 @@ void appendConfigForm(String &p, const char *msgHtml) {
   p += F("</div>");  // end admin pane
 
   p += F("<button type=submit>Save &amp; reboot</button></form>");
+  p += F("<a href=/log><button class=alt type=button>View log</button></a>");
   p += F("<form method=post action=/logout><button class=alt type=submit>Sign out</button></form>");
 
   p += F("<script>"
@@ -496,6 +501,45 @@ void handleSave() {
   g_rebootAtMs = millis() + 1500;  // let the response flush first
 }
 
+// The log as plain text, polled by the page below. Kept separate from the HTML so
+// a refresh costs one small body rather than re-rendering the whole page.
+void handleLogText() {
+  if (!guard(/*requireAuth=*/true)) {
+    return;
+  }
+  String body;
+  body.reserve(logbuf::kLines * 64);
+  logbuf::render(body);
+  noStore();
+  server.send(200, "text/plain", body);
+}
+
+void handleLog() {
+  if (!guard(/*requireAuth=*/true)) {
+    return;
+  }
+  String p = pageHead("SpoolGate — Log");
+  p += F("<h1>SpoolGate</h1><p class=sub>Log</p>");
+  p += F("<a href=/><button class=alt type=button>Back to settings</button></a>");
+  p += F("<label><input type=checkbox id=follow checked style='width:auto;margin-right:6px'>"
+         "Auto-refresh every 3s, pinned to the newest line</label>");
+  p += F("<pre class=log id=log>loading...</pre>");
+  p += F("<script>"
+         "var el=document.getElementById('log'),fo=document.getElementById('follow');"
+         "function load(){fetch('/log.txt',{cache:'no-store'}).then(function(r){"
+         "if(!r.ok)throw 0;return r.text()}).then(function(t){"
+         // Only touch the DOM when the text actually changed, so a reader scrolled
+         // back through the buffer is not yanked to the bottom every three seconds.
+         "if(t===el.textContent)return;el.textContent=t;"
+         "if(fo.checked)el.scrollTop=el.scrollHeight;})"
+         ".catch(function(){el.textContent+='\n[disconnected from router]';});}"
+         "load();setInterval(function(){if(fo.checked)load();},3000);"
+         "</script>");
+  p += kPageFoot;
+  noStore();
+  server.send(200, "text/html", p);
+}
+
 void handleNotFound() {
   if (!fromLan()) {
     server.send(403, "text/plain", "Forbidden");
@@ -515,6 +559,8 @@ void begin() {
   server.on("/login", HTTP_POST, handleLoginPost);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/logout", HTTP_POST, handleLogout);
+  server.on("/log", HTTP_GET, handleLog);
+  server.on("/log.txt", HTTP_GET, handleLogText);
   server.onNotFound(handleNotFound);
 
   server.begin();

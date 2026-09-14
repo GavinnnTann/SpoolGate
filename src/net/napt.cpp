@@ -1,5 +1,7 @@
 #include "napt.h"
 
+#include "../logbuf.h"
+
 #include <WiFi.h>
 
 namespace napt {
@@ -11,7 +13,7 @@ void enable() {
     return;
   }
   bool ok = WiFi.AP.enableNAPT(true);
-  Serial.printf("[%10lu] enableNAPT(true) returned %d\n", millis(), ok);
+  logbuf::printf("[%10lu] enableNAPT(true) returned %d\n", millis(), ok);
   s_enabled = ok;
 }
 

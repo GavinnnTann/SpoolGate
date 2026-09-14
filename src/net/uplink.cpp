@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_eap_client.h>
 
+#include "../logbuf.h"
 #include "../config.h"
 
 namespace uplink {
@@ -27,7 +28,7 @@ void begin() {
   // is otherwise invisible: the firmware dials an SSID you thought you had changed
   // and the only symptom is NO_AP_FOUND. The length is printed because a trailing
   // space or a homoglyph in the SSID looks identical on a serial console.
-  Serial.printf(
+  logbuf::printf(
     "[%10lu] STA target: SSID=\"%s\" (%u chars) auth=%s\n", millis(), s.uplinkSsid.c_str(), s.uplinkSsid.length(),
     s.uplinkEnterprise ? "WPA2-Enterprise" : "WPA2-Personal"
   );
@@ -38,7 +39,7 @@ void begin() {
     // "Reason: 1 - UNSPECIFIED", which is indistinguishable from the AP simply
     // refusing us — so the credentials have to be visible here to tell the two
     // apart. They are wiped by any code path that writes config without them.
-    Serial.printf(
+    logbuf::printf(
       "[%10lu] EAP: identity=\"%s\" username=\"%s\" password=%u chars\n", millis(), s.eapIdentity.c_str(), s.eapUsername.c_str(),
       s.eapPassword.length()
     );

@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 
+#include "logbuf.h"
 #include "config.h"
 #include "nat_debug.h"
 #include "net/health.h"
@@ -78,7 +79,7 @@ const char *healthName(health::Result r) {
 }
 
 void logLine(const char *msg) {
-  Serial.printf("[%10lu] %s\n", millis(), msg);
+  logbuf::printf("[%10lu] %s\n", millis(), msg);
 }
 
 #if NAT_DEBUG
@@ -110,11 +111,11 @@ const char *wlStatusName(wl_status_t status) {
 void runUplinkSelfTest() {
   IPAddress resolved;
   bool dnsOk = WiFi.hostByName("neverssl.com", resolved);
-  Serial.printf("[%10lu] selftest DNS neverssl.com -> %s (ok=%d)\n", millis(), resolved.toString().c_str(), dnsOk);
+  logbuf::printf("[%10lu] selftest DNS neverssl.com -> %s (ok=%d)\n", millis(), resolved.toString().c_str(), dnsOk);
 
   NetworkClient client;
   bool tcpOk = client.connect(IPAddress(1, 1, 1, 1), 80, 5000);
-  Serial.printf("[%10lu] selftest TCP 1.1.1.1:80 ok=%d\n", millis(), tcpOk);
+  logbuf::printf("[%10lu] selftest TCP 1.1.1.1:80 ok=%d\n", millis(), tcpOk);
   client.stop();
 }
 
@@ -141,11 +142,11 @@ const char *authName(wifi_auth_mode_t m) {
 void runScan() {
   int n = WiFi.scanNetworks();
   if (n <= 0) {
-    Serial.printf("[%10lu] scan: no networks visible (%d)\n", millis(), n);
+    logbuf::printf("[%10lu] scan: no networks visible (%d)\n", millis(), n);
   } else {
-    Serial.printf("[%10lu] scan: %d networks visible (2.4 GHz band only)\n", millis(), n);
+    logbuf::printf("[%10lu] scan: %d networks visible (2.4 GHz band only)\n", millis(), n);
     for (int i = 0; i < n; i++) {
-      Serial.printf(
+      logbuf::printf(
         "   ch%-3d %4d dBm  %-16s \"%s\"\n", WiFi.channel(i), WiFi.RSSI(i), authName(WiFi.encryptionType(i)), WiFi.SSID(i).c_str()
       );
     }
@@ -204,7 +205,7 @@ void reconcileNapt() {
 void scheduleReconnect() {
   reconnectAtMs = millis() + backoffMs;
   reconnectPending = true;
-  Serial.printf("[%10lu] STA reconnect scheduled in %lu ms\n", millis(), (unsigned long)backoffMs);
+  logbuf::printf("[%10lu] STA reconnect scheduled in %lu ms\n", millis(), (unsigned long)backoffMs);
   backoffMs = min(backoffMs * 2, kBackoffMaxMs);
 }
 
@@ -217,7 +218,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       uplinkReady = true;
       logLine("STA got IP");
-      Serial.printf(
+      logbuf::printf(
         "  IP: %s  Gateway: %s  DNS: %s  channel: %d\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
         WiFi.dnsIP(0).toString().c_str(), WiFi.channel()
       );
@@ -258,7 +259,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 
     case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
       clientIp = IPAddress(info.wifi_ap_staipassigned.ip.addr);
-      Serial.printf("[%10lu] DHCP lease issued: %s\n", millis(), clientIp.toString().c_str());
+      logbuf::printf("[%10lu] DHCP lease issued: %s\n", millis(), clientIp.toString().c_str());
       leaseSeen = true;
       break;
 
@@ -280,7 +281,8 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.printf("\nSpoolGate — ESP32 NAT router — arduino-esp32 core %s\n", ESP_ARDUINO_VERSION_STR);
+  logbuf::begin();
+  logbuf::printf("\nSpoolGate — ESP32 NAT router — arduino-esp32 core %s\n", ESP_ARDUINO_VERSION_STR);
 
   watchdog::begin();
 
@@ -297,7 +299,7 @@ void setup() {
   } else {
     logLine("AP UP");
     portal::begin();
-    Serial.printf("[%10lu] Admin portal at http://%s/\n", millis(), config::settings.apIp.toString().c_str());
+    logbuf::printf("[%10lu] Admin portal at http://%s/\n", millis(), config::settings.apIp.toString().c_str());
   }
 
   health::begin();
@@ -353,7 +355,7 @@ void loop() {
   int32_t channel = radioChannel;
   if (channel != lastChannel) {
     if (lastChannel != -1) {
-      Serial.printf("[%10lu] SoftAP channel moved %d -> %d (clients must re-associate)\n", millis(), lastChannel, channel);
+      logbuf::printf("[%10lu] SoftAP channel moved %d -> %d (clients must re-associate)\n", millis(), lastChannel, channel);
     }
     lastChannel = channel;
   }
@@ -366,7 +368,7 @@ void loop() {
   static uint32_t lastBeatMs = 0;
   if (lastBeatMs == 0 || millis() - lastBeatMs >= 30000) {
     lastBeatMs = millis();
-    Serial.printf(
+    logbuf::printf(
       "[%10lu] uplink=%s ch=%d rssi=%d clients=%u napt=%d health up=%s down=%s\n", millis(), uplinkReady ? "up" : "down", channel, WiFi.RSSI(),
       radioStations, napt::isEnabled(), healthName(health::upstream()), healthName(health::downstream())
     );
@@ -410,7 +412,7 @@ void loop() {
   static uint32_t lastApLog = 0;
   if (millis() - lastApLog > 5000) {
     lastApLog = millis();
-    Serial.printf(
+    logbuf::printf(
       "[%10lu] AP IP: %s  Stations: %d  DHCPS: %s  DNSoffer: %s  NAPT: %d  ch: %d  STA rssi: %d\n", millis(), WiFi.softAPIP().toString().c_str(),
       WiFi.softAPgetStationNum(), softap::dhcpsStatusName(), softap::dnsOffered().toString().c_str(), napt::isEnabled(), WiFi.channel(), WiFi.RSSI()
     );
@@ -425,7 +427,7 @@ void loop() {
   static uint32_t lastStatusLog = 0;
   if (!napt::isEnabled() && millis() - lastStatusLog > 3000) {
     lastStatusLog = millis();
-    Serial.printf("[%10lu] STA status: %s\n", millis(), wlStatusName(WiFi.status()));
+    logbuf::printf("[%10lu] STA status: %s\n", millis(), wlStatusName(WiFi.status()));
   }
 #endif  // NAT_DEBUG
 

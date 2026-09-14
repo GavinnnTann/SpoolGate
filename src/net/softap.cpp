@@ -4,6 +4,7 @@
 #include <esp_netif.h>
 #include <dhcpserver/dhcpserver.h>
 
+#include "../logbuf.h"
 #include "../config.h"
 
 namespace softap {
@@ -76,7 +77,7 @@ void applyDnsOffer(const IPAddress &dns) {
   esp_err_t startErr = esp_netif_dhcps_start(netif);
 
 #if NAT_DEBUG
-  Serial.printf(
+  logbuf::printf(
     "[%10lu] DNS offer %s: set_dns=%s option=%s dhcps_start=%s\n", millis(), dns.toString().c_str(), esp_err_to_name(dnsErr), esp_err_to_name(optErr),
     esp_err_to_name(startErr)
   );
