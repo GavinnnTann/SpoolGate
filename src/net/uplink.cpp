@@ -14,6 +14,15 @@ void begin() {
 
   const config::Settings &s = config::settings;
 
+  // Log the target on every attempt. NVS overrides secrets.h, so a stale NVS entry
+  // is otherwise invisible: the firmware dials an SSID you thought you had changed
+  // and the only symptom is NO_AP_FOUND. The length is printed because a trailing
+  // space or a homoglyph in the SSID looks identical on a serial console.
+  Serial.printf(
+    "[%10lu] STA target: SSID=\"%s\" (%u chars) auth=%s\n", millis(), s.uplinkSsid.c_str(), s.uplinkSsid.length(),
+    s.uplinkEnterprise ? "WPA2-Enterprise" : "WPA2-Personal"
+  );
+
   if (s.uplinkEnterprise) {
     esp_eap_client_set_identity(reinterpret_cast<const unsigned char *>(s.eapIdentity.c_str()), s.eapIdentity.length());
     esp_eap_client_set_username(reinterpret_cast<const unsigned char *>(s.eapUsername.c_str()), s.eapUsername.length());
