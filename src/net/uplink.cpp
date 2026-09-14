@@ -12,6 +12,15 @@ void begin() {
   // not the framework's built-in auto-reconnect.
   WiFi.setAutoReconnect(false);
 
+  // Abort anything still in flight before touching the config. STAClass::connect()
+  // only tears down an STA that is fully connected; if the previous attempt is
+  // still associating or authenticating, esp_wifi_set_config() refuses with
+  // ESP_ERR_WIFI_STATE ("sta is connecting, cannot set config") and WiFi.begin()
+  // does nothing whatsoever — the log records an attempt that was never made.
+  // Async (timeout 0) so this never blocks loop(); the resulting disconnect event
+  // lands while main has attemptActive set and is correctly ignored.
+  WiFi.disconnect(/*wifioff=*/false, /*eraseap=*/false, /*timeoutLength=*/0);
+
   const config::Settings &s = config::settings;
 
   // Log the target on every attempt. NVS overrides secrets.h, so a stale NVS entry
