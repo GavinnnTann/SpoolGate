@@ -60,6 +60,42 @@ void runUplinkSelfTest() {
   Serial.printf("[%10lu] selftest TCP 1.1.1.1:80 ok=%d\n", millis(), tcpOk);
   client.stop();
 }
+
+const char *authName(wifi_auth_mode_t m) {
+  switch (m) {
+    case WIFI_AUTH_OPEN:            return "OPEN";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA-PSK";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2-PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2-PSK";
+    case WIFI_AUTH_ENTERPRISE:      return "WPA2-ENTERPRISE";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3-PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3-PSK";
+    default:                        return "OTHER";
+  }
+}
+
+// Dumps every AP the radio can actually see. NO_AP_FOUND on its own is ambiguous:
+// it only says the configured SSID was absent from the scan results, which covers
+// both a wrong SSID string and an AP that is out of reach. The ESP32-S3 has no
+// 5 GHz radio, so a dual-band campus SSID that is 5 GHz-only in this room is
+// invisible here while every laptop nearby sits happily connected to it. Seeing
+// the raw scan list separates those two cases in one glance.
+void runScan() {
+  int n = WiFi.scanNetworks();
+  if (n <= 0) {
+    Serial.printf("[%10lu] scan: no networks visible (%d)\n", millis(), n);
+  } else {
+    Serial.printf("[%10lu] scan: %d networks visible (2.4 GHz band only)\n", millis(), n);
+    for (int i = 0; i < n; i++) {
+      Serial.printf(
+        "   ch%-3d %4d dBm  %-16s \"%s\"\n", WiFi.channel(i), WiFi.RSSI(i), authName(WiFi.encryptionType(i)), WiFi.SSID(i).c_str()
+      );
+    }
+  }
+  WiFi.scanDelete();
+}
+
 #endif  // NAT_DEBUG
 
 void scheduleReconnect() {
@@ -179,6 +215,15 @@ void loop() {
   statusled::update(ledState);
 
 #if NAT_DEBUG
+  // Scan whenever the uplink is down. Cheap on the 60 s backoff, and it is the only
+  // thing that tells a wrong SSID apart from an AP the ESP32's 2.4 GHz radio cannot
+  // reach. Blocking for ~3 s is fine here — nothing is being forwarded anyway.
+  static uint32_t lastScan = 0;
+  if (!uplinkReady && (lastScan == 0 || millis() - lastScan > 30000)) {
+    lastScan = millis();
+    runScan();
+  }
+
   // Uplink self-test. Repeats rather than running once, so the result can't be
   // missed by a serial monitor that attaches after boot.
   static uint32_t lastSelfTest = 0;
