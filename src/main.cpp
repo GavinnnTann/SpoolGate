@@ -7,6 +7,7 @@
 #include "net/softap.h"
 #include "net/uplink.h"
 #include "statusled.h"
+#include "watchdog.h"
 #include "web/portal.h"
 
 namespace {
@@ -178,6 +179,8 @@ void setup() {
   delay(200);
   Serial.printf("\nSpoolGate — ESP32 NAT router — arduino-esp32 core %s\n", ESP_ARDUINO_VERSION_STR);
 
+  watchdog::begin();
+
   config::begin();
   statusled::setBrightness(config::settings.ledBrightness);
   statusled::begin();
@@ -199,6 +202,10 @@ void setup() {
 }
 
 void loop() {
+  // First statement in loop(): reaching it is the definition of "still alive",
+  // and it is also what clears the uplink stall clock once the STA holds an IP.
+  watchdog::update(uplinkReady);
+
   portal::loop();
 
   // Status LED reflects link state at a glance (see statusled.h for the colour map).
