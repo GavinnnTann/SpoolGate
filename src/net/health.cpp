@@ -1,5 +1,7 @@
 #include "health.h"
 
+#include "../logbuf.h"
+
 #include <Arduino.h>
 #include <atomic>
 #include <lwip/inet.h>
@@ -106,14 +108,14 @@ void harvest(Probe &p) {
   if (ok) {
     p.everOk = true;
     if (p.failStreak != 0) {
-      Serial.printf("[%10lu] health: %s recovered\n", millis(), p.name);
+      logbuf::printf("[%10lu] health: %s recovered\n", millis(), p.name);
     }
     p.failStreak = 0;
   } else {
     if (p.failStreak < 255) {
       p.failStreak++;
     }
-    Serial.printf("[%10lu] health: %s unreachable (%u in a row)\n", millis(), p.name, p.failStreak);
+    logbuf::printf("[%10lu] health: %s unreachable (%u in a row)\n", millis(), p.name, p.failStreak);
   }
 
   esp_ping_stop(p.handle);

@@ -1,3 +1,4 @@
+#include "logbuf.h"
 #include "watchdog.h"
 
 #include <Arduino.h>
@@ -73,7 +74,7 @@ void markUplinkDown() {
 }
 
 void reboot(const char *why) {
-  Serial.printf("[%10lu] WATCHDOG: %s — rebooting\n", millis(), why);
+  logbuf::printf("[%10lu] WATCHDOG: %s — rebooting\n", millis(), why);
   Serial.flush();
   delay(50);  // let the UART drain; the reset reason on the next boot reads SW
   esp_restart();
@@ -110,7 +111,7 @@ void begin() {
   // supply cannot hold the rail under WiFi transmit bursts.
   esp_reset_reason_t reason = esp_reset_reason();
   g_resetReason = resetReasonName(reason);
-  Serial.printf("[%10lu] last reset: %s\n", millis(), resetReasonName(reason));
+  logbuf::printf("[%10lu] last reset: %s\n", millis(), resetReasonName(reason));
 
   // Start both clocks running now. The uplink is down until proven otherwise, so
   // a board that never manages to associate still reboots on schedule rather than
@@ -125,7 +126,7 @@ void begin() {
   if (ok != pdPASS) {
     // Non-fatal: the router works, it just loses unattended recovery. Worth saying
     // out loud rather than silently running without the safety net.
-    Serial.printf("[%10lu] WATCHDOG: supervisor task failed to start — no auto-recovery\n", millis());
+    logbuf::printf("[%10lu] WATCHDOG: supervisor task failed to start — no auto-recovery\n", millis());
     g_armed = false;
   }
 }
