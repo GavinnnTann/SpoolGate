@@ -58,6 +58,14 @@ uint32_t lastApAssocMs = 0;
 bool leaseSeen = false;
 bool softApFailed = false;
 
+const char *healthName(health::Result r) {
+  switch (r) {
+    case health::Result::Ok:     return "ok";
+    case health::Result::Failed: return "FAIL";
+    default:                     return "?";
+  }
+}
+
 void logLine(const char *msg) {
   Serial.printf("[%10lu] %s\n", millis(), msg);
 }
@@ -188,7 +196,8 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       uplinkReady = true;
       logLine("STA got IP");
       Serial.printf(
-        "  IP: %s  Gateway: %s  DNS: %s\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(), WiFi.dnsIP(0).toString().c_str()
+        "  IP: %s  Gateway: %s  DNS: %s  channel: %d\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
+        WiFi.dnsIP(0).toString().c_str(), WiFi.channel()
       );
       // NAPT is deliberately NOT enabled here, even though the uplink is now
       // usable. Enabling NAPT stops the SoftAP's DHCP server from completing
@@ -312,6 +321,34 @@ void loop() {
     health::resetStreaks();
     esp_wifi_deauth_sta(0);  // 0 = every associated station
   }
+
+  // The radio serves one channel for both interfaces, so associating upstream
+  // drags the SoftAP onto the uplink AP's channel and every downstream client is
+  // dropped and has to find the AP again. That is the single most likely reason
+  // for a client that will not rejoin, and it was previously invisible.
+  static int lastChannel = -1;
+  int channel = WiFi.channel();
+  if (channel != lastChannel) {
+    if (lastChannel != -1) {
+      Serial.printf("[%10lu] SoftAP channel moved %d -> %d (clients must re-associate)\n", millis(), lastChannel, channel);
+    }
+    lastChannel = channel;
+  }
+
+#if !NAT_DEBUG
+  // A deployed router that prints nothing between state changes is
+  // indistinguishable from a hung one. "Amber and silent" reads as a crash even
+  // when the only thing happening is that no client has joined yet, so the
+  // production build emits one line every 30 s saying so.
+  static uint32_t lastBeatMs = 0;
+  if (lastBeatMs == 0 || millis() - lastBeatMs >= 30000) {
+    lastBeatMs = millis();
+    Serial.printf(
+      "[%10lu] uplink=%s ch=%d rssi=%d clients=%u napt=%d health up=%s down=%s\n", millis(), uplinkReady ? "up" : "down", channel, WiFi.RSSI(),
+      WiFi.softAPgetStationNum(), napt::isEnabled(), healthName(health::upstream()), healthName(health::downstream())
+    );
+  }
+#endif
 
   // Status LED reflects link state at a glance (see statusled.h for the colour map).
   statusled::State ledState;
