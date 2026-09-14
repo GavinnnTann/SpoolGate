@@ -38,6 +38,8 @@ volatile uint32_t g_lastLoopMs = 0;
 volatile uint32_t g_uplinkDownSinceMs = 0;  // 0 means the uplink is up
 volatile bool g_armed = false;
 
+const char *g_resetReason = "(not read)";
+
 const char *resetReasonName(esp_reset_reason_t r) {
   switch (r) {
     case ESP_RST_POWERON:    return "POWERON (clean power-up)";
@@ -107,6 +109,7 @@ void begin() {
   // from a watchdog reboot from a clean power-up. BROWNOUT here means the USB
   // supply cannot hold the rail under WiFi transmit bursts.
   esp_reset_reason_t reason = esp_reset_reason();
+  g_resetReason = resetReasonName(reason);
   Serial.printf("[%10lu] last reset: %s\n", millis(), resetReasonName(reason));
 
   // Start both clocks running now. The uplink is down until proven otherwise, so
@@ -125,6 +128,10 @@ void begin() {
     Serial.printf("[%10lu] WATCHDOG: supervisor task failed to start — no auto-recovery\n", millis());
     g_armed = false;
   }
+}
+
+const char *lastResetReason() {
+  return g_resetReason;
 }
 
 void update(bool uplinkReady) {

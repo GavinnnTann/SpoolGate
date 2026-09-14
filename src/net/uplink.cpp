@@ -24,6 +24,16 @@ void begin() {
   );
 
   if (s.uplinkEnterprise) {
+    // Identity and username are logged, the password only as a length. An empty
+    // value in any of the three makes the association fail immediately with a bare
+    // "Reason: 1 - UNSPECIFIED", which is indistinguishable from the AP simply
+    // refusing us — so the credentials have to be visible here to tell the two
+    // apart. They are wiped by any code path that writes config without them.
+    Serial.printf(
+      "[%10lu] EAP: identity=\"%s\" username=\"%s\" password=%u chars\n", millis(), s.eapIdentity.c_str(), s.eapUsername.c_str(),
+      s.eapPassword.length()
+    );
+
     esp_eap_client_set_identity(reinterpret_cast<const unsigned char *>(s.eapIdentity.c_str()), s.eapIdentity.length());
     esp_eap_client_set_username(reinterpret_cast<const unsigned char *>(s.eapUsername.c_str()), s.eapUsername.length());
     esp_eap_client_set_password(reinterpret_cast<const unsigned char *>(s.eapPassword.c_str()), s.eapPassword.length());

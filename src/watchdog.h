@@ -31,4 +31,10 @@ void begin();
 // true clears the uplink stall timer.
 void update(bool uplinkReady);
 
+// Why the board last reset, as a human-readable string. Captured once in begin(),
+// because esp_reset_reason() describes the boot that is running now. Surfacing it
+// in the admin portal is the only way to see a brownout or a watchdog reboot on a
+// board deployed with no serial cable attached.
+const char *lastResetReason();
+
 }  // namespace watchdog
