@@ -13,12 +13,28 @@
 namespace {
 
 constexpr uint32_t kBackoffInitialMs = 2000;
+
+// How long a single connection attempt is allowed to run before it is abandoned
+// and retried. An enterprise SSID is carried by many APs, and esp_wifi works
+// through them in turn, raising a disconnect event for each BSSID it fails on
+// while remaining in the connecting state throughout. Those per-BSSID events are
+// not attempt failures, so the attempt is bounded by this deadline instead.
+// Successful associations here complete in 1.5-3 s, so 20 s is generous.
+constexpr uint32_t kAttemptTimeoutMs = 20000;
 constexpr uint32_t kBackoffMaxMs = 60000;
 
 uint32_t backoffMs = kBackoffInitialMs;
 uint32_t reconnectAtMs = 0;
 bool reconnectPending = false;
 bool uplinkReady = false;
+
+// True from the moment uplink::begin() is called until the attempt either yields
+// an IP or hits kAttemptTimeoutMs. While set, disconnect events are informational
+// only: acting on them is what produced "sta is connecting, cannot set config"
+// (ESP_ERR_WIFI_STATE), where the retry timer fired into an attempt that was
+// still running and WiFi.begin() silently did nothing at all.
+bool attemptActive = false;
+uint32_t attemptStartedMs = 0;
 bool softApFailed = false;
 
 void logLine(const char *msg) {
@@ -99,6 +115,14 @@ void runScan() {
 
 #endif  // NAT_DEBUG
 
+// The single path that starts a connection attempt, so the bookkeeping cannot
+// drift out of step with the radio.
+void startAttempt() {
+  attemptActive = true;
+  attemptStartedMs = millis();
+  uplink::begin();
+}
+
 void scheduleReconnect() {
   reconnectAtMs = millis() + backoffMs;
   reconnectPending = true;
@@ -132,6 +156,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       }
       backoffMs = kBackoffInitialMs;
       reconnectPending = false;
+      attemptActive = false;
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
@@ -141,7 +166,15 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
         napt::disable();
         logLine("NAPT OFF (uplink lost)");
       }
-      scheduleReconnect();
+      // Only a drop from an established link schedules a retry. During an attempt
+      // these events are the driver working through the BSSIDs behind the SSID —
+      // treating each as a failure is what made the retry timer fire into a
+      // connection that was still being set up, where WiFi.begin() is refused
+      // outright and the backoff doubles for an attempt never actually made.
+      // An attempt that genuinely gets nowhere is caught by kAttemptTimeoutMs.
+      if (!attemptActive) {
+        scheduleReconnect();
+      }
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
@@ -197,7 +230,7 @@ void setup() {
     Serial.printf("[%10lu] Admin portal at http://%s/\n", millis(), config::settings.apIp.toString().c_str());
   }
 
-  uplink::begin();
+  startAttempt();
   logLine("STA connecting");
 }
 
@@ -264,9 +297,18 @@ void loop() {
   }
 #endif  // NAT_DEBUG
 
+  // Abandon an attempt that has run past its deadline without producing an IP,
+  // and fall into the normal backoff. This is what bounds a connect that the
+  // driver never resolves either way.
+  if (attemptActive && millis() - attemptStartedMs >= kAttemptTimeoutMs) {
+    attemptActive = false;
+    logLine("STA attempt timed out");
+    scheduleReconnect();
+  }
+
   if (reconnectPending && millis() >= reconnectAtMs) {
     reconnectPending = false;
     logLine("STA reconnecting");
-    uplink::begin();
+    startAttempt();
   }
 }
