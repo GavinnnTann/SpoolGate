@@ -1,10 +1,13 @@
 #include "portal.h"
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include <WebServer.h>
 #include <esp_random.h>
 
 #include "../config.h"
+#include "../net/napt.h"
+#include "../watchdog.h"
 
 namespace portal {
 
@@ -51,6 +54,10 @@ const char kCss[] =
   ".pane{display:none}"
   "input[type=range]{padding:0;height:28px}"
   ".big{font-size:22px;font-weight:600}"
+  ".kv{display:flex;justify-content:space-between;gap:12px;padding:6px 0;"
+  "border-bottom:1px solid #1c212b;font-size:13px}"
+  ".kv span{color:#8b93a1}.kv b{font-weight:600;text-align:right;word-break:break-all}"
+  ".up{color:#86efac}.down{color:#fca5a5}"
   "</style>";
 
 String htmlEscape(const String &in) {
@@ -125,7 +132,20 @@ bool isAuthed() {
   return true;
 }
 
+// Every portal response carries no-store. Without it a browser is free to cache
+// the settings page heuristically (it is a 200 text/html from a bare IP with no
+// validators), and a cached page is not merely stale to look at: every field is
+// rendered with value= and posted back on save, so submitting a stale form
+// silently writes the old SSID and EAP credentials back into NVS even when the
+// operator only touched the LED slider.
+void noStore() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+}
+
 void redirect(const char *path) {
+  noStore();
   server.sendHeader("Location", path);
   server.send(302, "text/plain", "");
 }
@@ -159,6 +179,7 @@ void sendLogin(const char *errMsg) {
          "<label>Password</label><input name=p type=password autocomplete=current-password>"
          "<button type=submit>Sign in</button></form>");
   p += kPageFoot;
+  noStore();
   server.send(200, "text/html", p);
 }
 
@@ -195,6 +216,85 @@ void handleLogout() {
   g_session = "";
   server.sendHeader("Set-Cookie", "SESSION=; Path=/; Max-Age=0");
   redirect("/login");
+}
+
+const char *staStatusName(wl_status_t st) {
+  switch (st) {
+    case WL_CONNECTED:     return "connected";
+    case WL_NO_SSID_AVAIL: return "SSID not found in scan";
+    case WL_CONNECT_FAILED: return "connect failed";
+    case WL_CONNECTION_LOST: return "connection lost";
+    case WL_DISCONNECTED:  return "disconnected";
+    case WL_IDLE_STATUS:   return "idle";
+    case WL_SCAN_COMPLETED: return "scan completed";
+    default:               return "unknown";
+  }
+}
+
+void kv(String &p, const char *k, const String &v, const char *cls = nullptr) {
+  p += F("<div class=kv><span>");
+  p += k;
+  p += F("</span><b");
+  if (cls != nullptr) {
+    p += F(" class=");
+    p += cls;
+  }
+  p += F(">");
+  p += htmlEscape(v);
+  p += F("</b></div>");
+}
+
+// Renders a stored secret as a length rather than a value: enough to tell "set" from
+// "silently blanked" without putting the credential on screen.
+String secretSummary(const String &secret) {
+  return secret.isEmpty() ? String(F("(not set)")) : String(secret.length()) + F(" chars stored");
+}
+
+String uptimeString() {
+  uint32_t t = millis() / 1000;
+  char buf[32];
+  snprintf(
+    buf, sizeof(buf), "%ud %02u:%02u:%02u", (unsigned)(t / 86400), (unsigned)((t % 86400) / 3600), (unsigned)((t % 3600) / 60),
+    (unsigned)(t % 60)
+  );
+  return String(buf);
+}
+
+// What the firmware is using right now, as opposed to what the form below will set.
+// Read straight from the running WiFi stack and config::settings on every request,
+// so it cannot be served stale. The credential rows matter most: a blanked EAP
+// identity is otherwise invisible until the uplink quietly stops associating, and
+// that is exactly the failure a resubmitted stale form produces.
+void appendStatus(String &p) {
+  const config::Settings &s = config::settings;
+  bool up = WiFi.status() == WL_CONNECTED;
+
+  p += F("<h2>Current state</h2>");
+  kv(p, "Uplink", up ? F("Up") : F("Down"), up ? "up" : "down");
+  kv(p, "STA status", staStatusName(WiFi.status()));
+  kv(p, "SSID in use", s.uplinkSsid);
+  kv(p, "Security", s.uplinkEnterprise ? F("WPA2-Enterprise (802.1X)") : F("WPA2-Personal"));
+
+  if (s.uplinkEnterprise) {
+    kv(p, "EAP identity", s.eapIdentity.isEmpty() ? String(F("(empty)")) : s.eapIdentity, s.eapIdentity.isEmpty() ? "down" : nullptr);
+    kv(p, "EAP username", s.eapUsername.isEmpty() ? String(F("(empty)")) : s.eapUsername, s.eapUsername.isEmpty() ? "down" : nullptr);
+    kv(p, "EAP password", secretSummary(s.eapPassword), s.eapPassword.isEmpty() ? "down" : nullptr);
+  } else {
+    kv(p, "Password", secretSummary(s.uplinkPass), s.uplinkPass.isEmpty() ? "down" : nullptr);
+  }
+
+  if (up) {
+    kv(p, "IP address", WiFi.localIP().toString());
+    kv(p, "Gateway", WiFi.gatewayIP().toString());
+    kv(p, "Upstream DNS", WiFi.dnsIP(0).toString());
+    kv(p, "Signal", String(WiFi.RSSI()) + F(" dBm"));
+  }
+
+  kv(p, "SoftAP", s.apSsid + F(" on ") + s.apIp.toString());
+  kv(p, "Clients joined", String(WiFi.softAPgetStationNum()));
+  kv(p, "NAPT", napt::isEnabled() ? F("on") : F("off"), napt::isEnabled() ? "up" : "down");
+  kv(p, "Uptime", uptimeString());
+  kv(p, "Last reset", watchdog::lastResetReason());
 }
 
 void appendConfigForm(String &p, const char *msgHtml) {
@@ -285,8 +385,13 @@ void appendConfigForm(String &p, const char *msgHtml) {
 void sendConfig(const char *msgHtml) {
   String p = pageHead("SpoolGate — Settings");
   p += F("<h1>SpoolGate</h1><p class=sub>Settings</p>");
-  appendConfigForm(p, msgHtml);
+  if (msgHtml != nullptr) {
+    p += msgHtml;
+  }
+  appendStatus(p);
+  appendConfigForm(p, nullptr);
   p += kPageFoot;
+  noStore();
   server.send(200, "text/html", p);
 }
 
@@ -327,6 +432,8 @@ void handleSave() {
     err = "DNS address is not a valid IPv4 address.";
   } else if (apPass.length() > 0 && apPass.length() < 8) {
     err = "Downstream password must be at least 8 characters.";
+  } else if (server.arg("uAuth") == "ent" && server.arg("eapUser").isEmpty() && config::settings.eapUsername.isEmpty()) {
+    err = "802.1X username cannot be empty.";
   }
 
   if (!err.isEmpty()) {
@@ -338,12 +445,27 @@ void handleSave() {
   }
 
   n.uplinkSsid = uSsid;
-  n.uplinkEnterprise = (server.arg("uAuth") == "ent");
+
+  // Every field below is applied only when the form actually carried a value for
+  // it. Assigning unconditionally means a partial POST — a stale cached page, a
+  // truncated submit, a hand-rolled request — silently blanks the EAP credentials
+  // or drops the security mode back to WPA2-Personal, either of which strands the
+  // router with no way upstream and no indication of why. Passwords already worked
+  // this way; the identity and username did not, and they are just as fatal to
+  // lose. The trade is that these fields can no longer be cleared from the portal,
+  // only replaced, which is no loss: an empty 802.1X identity has no valid use.
+  if (server.hasArg("uAuth")) {
+    n.uplinkEnterprise = (server.arg("uAuth") == "ent");
+  }
   if (server.arg("uPass").length() > 0) {
     n.uplinkPass = server.arg("uPass");
   }
-  n.eapIdentity = server.arg("eapId");
-  n.eapUsername = server.arg("eapUser");
+  if (server.arg("eapId").length() > 0) {
+    n.eapIdentity = server.arg("eapId");
+  }
+  if (server.arg("eapUser").length() > 0) {
+    n.eapUsername = server.arg("eapUser");
+  }
   if (server.arg("eapPass").length() > 0) {
     n.eapPassword = server.arg("eapPass");
   }
@@ -368,6 +490,7 @@ void handleSave() {
          "<div class='msg ok'>Rebooting to apply. If you changed the SoftAP name or "
          "password, reconnect to the new network, then browse to the AP IP address.</div>");
   p += kPageFoot;
+  noStore();
   server.send(200, "text/html", p);
 
   g_rebootAtMs = millis() + 1500;  // let the response flush first
