@@ -53,6 +53,17 @@ uint32_t attemptStartedMs = 0;
 // Downstream client tracking. clientIp is the address handed out by DHCP, kept so
 // the downstream probe has something to aim at; it survives the client leaving so
 // a re-association on the same lease is still probeable.
+// Cached radio state. WiFi.softAPgetStationNum() calls esp_wifi_ap_get_sta_list()
+// and WiFi.channel() calls esp_wifi_get_channel(); both take the WiFi API lock and
+// copy driver state. Reading them from every loop() iteration is tens of thousands
+// of lock acquisitions a second, contending with the very WiFi task that forwards
+// NAT traffic — measurably slower throughput for information that changes at human
+// speed. Sampled at 2 Hz instead, and read from cache everywhere in the hot path.
+constexpr uint32_t kRadioPollMs = 500;
+uint8_t radioStations = 0;
+int32_t radioChannel = 0;
+uint32_t lastRadioPollMs = 0;
+
 IPAddress clientIp;
 uint32_t lastApAssocMs = 0;
 bool leaseSeen = false;
@@ -158,8 +169,19 @@ void startAttempt() {
 // turned it back on: uplink up, client associated, LED blue, nothing forwarded and
 // no indication anywhere that anything was wrong. Reconciling every loop() makes
 // the state self-correcting no matter which events did or did not arrive.
+// Samples the radio counters that the hot path needs, at a rate the hot path can
+// afford. Everything downstream reads the cache rather than the driver.
+void pollRadio() {
+  if (lastRadioPollMs != 0 && millis() - lastRadioPollMs < kRadioPollMs) {
+    return;
+  }
+  lastRadioPollMs = millis();
+  radioStations = WiFi.softAPgetStationNum();
+  radioChannel = WiFi.channel();
+}
+
 void reconcileNapt() {
-  bool haveClient = WiFi.softAPgetStationNum() > 0;
+  bool haveClient = radioStations > 0;
 
   // The grace period is what protects DHCP: a freshly associated client that still
   // needs an address gets a window with NAPT off, and one that never asks (because
@@ -290,6 +312,7 @@ void loop() {
   watchdog::update(uplinkReady);
 
   portal::loop();
+  pollRadio();
 
   // NAPT follows the actual state of the uplink and the client, checked every
   // iteration rather than inferred from whichever events happened to fire.
@@ -326,8 +349,8 @@ void loop() {
   // drags the SoftAP onto the uplink AP's channel and every downstream client is
   // dropped and has to find the AP again. That is the single most likely reason
   // for a client that will not rejoin, and it was previously invisible.
-  static int lastChannel = -1;
-  int channel = WiFi.channel();
+  static int32_t lastChannel = -1;
+  int32_t channel = radioChannel;
   if (channel != lastChannel) {
     if (lastChannel != -1) {
       Serial.printf("[%10lu] SoftAP channel moved %d -> %d (clients must re-associate)\n", millis(), lastChannel, channel);
@@ -345,7 +368,7 @@ void loop() {
     lastBeatMs = millis();
     Serial.printf(
       "[%10lu] uplink=%s ch=%d rssi=%d clients=%u napt=%d health up=%s down=%s\n", millis(), uplinkReady ? "up" : "down", channel, WiFi.RSSI(),
-      WiFi.softAPgetStationNum(), napt::isEnabled(), healthName(health::upstream()), healthName(health::downstream())
+      radioStations, napt::isEnabled(), healthName(health::upstream()), healthName(health::downstream())
     );
   }
 #endif
@@ -356,7 +379,7 @@ void loop() {
     ledState = statusled::State::Fault;
   } else if (!uplinkReady) {
     ledState = statusled::State::UpstreamDown;
-  } else if (WiFi.softAPgetStationNum() == 0) {
+  } else if (radioStations == 0) {
     ledState = statusled::State::NoClients;
   } else {
     ledState = statusled::State::Connected;
