@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 
 #include "config.h"
 #include "nat_debug.h"
+#include "net/health.h"
 #include "net/napt.h"
 #include "net/softap.h"
 #include "net/uplink.h"
@@ -21,6 +23,18 @@ constexpr uint32_t kBackoffInitialMs = 2000;
 // not attempt failures, so the attempt is bounded by this deadline instead.
 // Successful associations here complete in 1.5-3 s, so 20 s is generous.
 constexpr uint32_t kAttemptTimeoutMs = 20000;
+
+// Grace period after a client associates before NAPT may be turned on. Enabling
+// NAPT starves the SoftAP's DHCP server, so a client that still needs to lease
+// must be given room to finish first. A client that re-associates on a lease it
+// already holds never does DHCP at all, which is why this is a timer and not
+// purely a wait for AP_STAIPASSIGNED.
+constexpr uint32_t kNaptLeaseGraceMs = 8000;
+
+// Consecutive failed probe rounds before recovery acts. At one round a minute
+// this is roughly three minutes of a path that carries no packets.
+constexpr uint8_t kUplinkFailStreak = 3;
+constexpr uint8_t kClientFailStreak = 3;
 constexpr uint32_t kBackoffMaxMs = 60000;
 
 uint32_t backoffMs = kBackoffInitialMs;
@@ -35,6 +49,13 @@ bool uplinkReady = false;
 // still running and WiFi.begin() silently did nothing at all.
 bool attemptActive = false;
 uint32_t attemptStartedMs = 0;
+
+// Downstream client tracking. clientIp is the address handed out by DHCP, kept so
+// the downstream probe has something to aim at; it survives the client leaving so
+// a re-association on the same lease is still probeable.
+IPAddress clientIp;
+uint32_t lastApAssocMs = 0;
+bool leaseSeen = false;
 bool softApFailed = false;
 
 void logLine(const char *msg) {
@@ -123,6 +144,33 @@ void startAttempt() {
   uplink::begin();
 }
 
+// Drives NAPT from the state the system is actually in, rather than from the one
+// event that happened to be convenient. NAPT used to be switched on only by
+// AP_STAIPASSIGNED, so a client re-associating on a lease it still held never
+// turned it back on: uplink up, client associated, LED blue, nothing forwarded and
+// no indication anywhere that anything was wrong. Reconciling every loop() makes
+// the state self-correcting no matter which events did or did not arrive.
+void reconcileNapt() {
+  bool haveClient = WiFi.softAPgetStationNum() > 0;
+
+  // The grace period is what protects DHCP: a freshly associated client that still
+  // needs an address gets a window with NAPT off, and one that never asks (because
+  // its lease is still valid) is picked up when that window expires.
+  bool leaseSettled = leaseSeen || (lastApAssocMs != 0 && millis() - lastApAssocMs >= kNaptLeaseGraceMs);
+  bool want = uplinkReady && haveClient && leaseSettled;
+
+  if (want == napt::isEnabled()) {
+    return;
+  }
+  if (want) {
+    napt::enable();
+    logLine("NAPT ON");
+  } else {
+    napt::disable();
+    logLine("NAPT OFF");
+  }
+}
+
 void scheduleReconnect() {
   reconnectAtMs = millis() + backoffMs;
   reconnectPending = true;
@@ -148,12 +196,6 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       // back to 169.254.x.x. Confirmed by A/B test on this hardware — identical
       // firmware, NAPT the only variable. So NAPT is deferred until a client
       // actually holds a lease (see ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED).
-      if (WiFi.softAPgetStationNum() > 0) {
-        // A client is already associated and presumably already leased (it must
-        // have leased while NAPT was off), so it is safe to turn NAPT on now.
-        napt::enable();
-        logLine("NAPT ON");
-      }
       backoffMs = kBackoffInitialMs;
       reconnectPending = false;
       attemptActive = false;
@@ -179,24 +221,21 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
       logLine("Printer associated with SoftAP");
+      lastApAssocMs = millis();
+      leaseSeen = false;  // it may re-DHCP; the grace timer covers it if it does not
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
-      Serial.printf("[%10lu] DHCP lease issued: %s\n", millis(), IPAddress(info.wifi_ap_staipassigned.ip.addr).toString().c_str());
-      // The lease is done, so NAPT can now be turned on without starving DHCP.
-      if (uplinkReady && !napt::isEnabled()) {
-        napt::enable();
-        logLine("NAPT ON");
-      }
+      clientIp = IPAddress(info.wifi_ap_staipassigned.ip.addr);
+      Serial.printf("[%10lu] DHCP lease issued: %s\n", millis(), clientIp.toString().c_str());
+      leaseSeen = true;
       break;
 
     case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
       logLine("Printer left SoftAP");
-      // Drop NAPT once nothing is associated, so the next client's DHCP
-      // handshake can complete. It gets re-enabled as soon as that client leases.
-      if (WiFi.softAPgetStationNum() == 0 && napt::isEnabled()) {
-        napt::disable();
-        logLine("NAPT OFF (no clients — keeps DHCP able to serve)");
+      if (WiFi.softAPgetStationNum() == 0) {
+        leaseSeen = false;
+        lastApAssocMs = 0;
       }
       break;
 
@@ -230,6 +269,8 @@ void setup() {
     Serial.printf("[%10lu] Admin portal at http://%s/\n", millis(), config::settings.apIp.toString().c_str());
   }
 
+  health::begin();
+
   startAttempt();
   logLine("STA connecting");
 }
@@ -240,6 +281,37 @@ void loop() {
   watchdog::update(uplinkReady);
 
   portal::loop();
+
+  // NAPT follows the actual state of the uplink and the client, checked every
+  // iteration rather than inferred from whichever events happened to fire.
+  reconcileNapt();
+
+  // Probe both directions. Non-blocking: lwIP's ping task does the work and this
+  // only starts rounds and collects results.
+  health::update(uplinkReady, WiFi.gatewayIP(), clientIp);
+
+  // An uplink that holds an IP but answers nothing is worse than one that is
+  // plainly down: every status signal reads healthy while no traffic moves. Tear
+  // it down and reconnect. Gated on the gateway having answered at least once, so
+  // a network that drops ICMP by policy can never drive a reconnect loop.
+  if (uplinkReady && health::upstreamEverOk() && health::upstreamFailStreak() >= kUplinkFailStreak) {
+    logLine("RECOVERY: uplink holds an IP but is unreachable — reconnecting");
+    health::resetStreaks();
+    uplinkReady = false;
+    attemptActive = false;
+    WiFi.disconnect(false, false, 0);
+    scheduleReconnect();
+  }
+
+  // Same reasoning downstream: associated and leased but not answering means the
+  // client's link is wedged, and the only lever we have is to push it off so it
+  // re-associates. Also gated on it having answered before, so a client that never
+  // replies to ICMP is never deauthed on suspicion.
+  if (health::downstreamEverOk() && health::downstreamFailStreak() >= kClientFailStreak) {
+    logLine("RECOVERY: client unreachable — deauthing to force re-association");
+    health::resetStreaks();
+    esp_wifi_deauth_sta(0);  // 0 = every associated station
+  }
 
   // Status LED reflects link state at a glance (see statusled.h for the colour map).
   statusled::State ledState;
