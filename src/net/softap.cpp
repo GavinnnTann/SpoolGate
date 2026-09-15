@@ -13,6 +13,22 @@ namespace {
 
 void applyDnsOffer(const IPAddress &dns);
 
+// DHCP lease handed to clients, in minutes. IDF defaults to DHCPS_LEASE_TIME_DEF,
+// which is 120 — two hours, with the client attempting renewal at half that.
+//
+// A renewal on this device does not work. NAPT stops the SoftAP's DHCP server from
+// completing exchanges, which is the whole reason NAPT is deferred until a client
+// has leased, and NAPT is by definition enabled once that client is up and being
+// forwarded. So the renewal at one hour goes unanswered, the rebind at 105 minutes
+// goes unanswered, and at two hours the lease expires and the client loses its
+// address while still associated. That is a printer that silently stops reaching
+// the cloud overnight behind an uplink that never dropped.
+//
+// A week-long lease means the question never arises in any plausible session. It is
+// a workaround rather than a fix — the fix is making DHCP work with NAPT enabled —
+// but it removes the failure from every realistic deployment.
+constexpr uint32_t kLeaseMinutes = 7 * 24 * 60;
+
 // Lease range start for the /24: AP IP host octet + 1 (e.g. .1 -> .2), clamped to
 // avoid landing on .255 / overflowing the octet.
 IPAddress leaseStartFor(const IPAddress &apIp) {
@@ -66,6 +82,11 @@ void applyDnsOffer(const IPAddress &dns) {
 
   esp_netif_dhcps_stop(netif);
 
+  // Both options must be set while the server is stopped; esp_netif_dhcps_option()
+  // returns ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED and does nothing otherwise.
+  uint32_t leaseMinutes = kLeaseMinutes;
+  esp_err_t leaseErr = esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET, ESP_NETIF_IP_ADDRESS_LEASE_TIME, &leaseMinutes, sizeof(leaseMinutes));
+
   esp_netif_dns_info_t dnsInfo = {};
   dnsInfo.ip.type = IPADDR_TYPE_V4;
   dnsInfo.ip.u_addr.ip4.addr = static_cast<uint32_t>(dns);
@@ -78,10 +99,11 @@ void applyDnsOffer(const IPAddress &dns) {
 
 #if NAT_DEBUG
   logbuf::printf(
-    "[%10lu] DNS offer %s: set_dns=%s option=%s dhcps_start=%s\n", millis(), dns.toString().c_str(), esp_err_to_name(dnsErr), esp_err_to_name(optErr),
-    esp_err_to_name(startErr)
+    "[%10lu] DNS offer %s: set_dns=%s option=%s dhcps_start=%s lease=%s (%lu min)\n", millis(), dns.toString().c_str(), esp_err_to_name(dnsErr),
+    esp_err_to_name(optErr), esp_err_to_name(startErr), esp_err_to_name(leaseErr), (unsigned long)kLeaseMinutes
   );
 #else
+  (void)leaseErr;
   (void)dnsErr;
   (void)optErr;
   (void)startErr;
