@@ -25,6 +25,14 @@ constexpr uint32_t kBackoffInitialMs = 2000;
 // Successful associations here complete in 1.5-3 s, so 20 s is generous.
 constexpr uint32_t kAttemptTimeoutMs = 20000;
 
+// How long the driver may stay silent after a disconnect, with no association, before
+// the attempt is written off. esp_wifi moves to the next BSSID behind the SSID within
+// a few hundred milliseconds, so silence this long means it has run out of candidates
+// rather than that it is still working. Without this an attempt always costs the full
+// kAttemptTimeoutMs even when it failed in the first 30 ms, which is precisely why
+// pressing reset beat waiting: reset restarts at the initial backoff immediately.
+constexpr uint32_t kAttemptQuietMs = 2000;
+
 // Grace period after a client associates before NAPT may be turned on. Enabling
 // NAPT starves the SoftAP's DHCP server, so a client that still needs to lease
 // must be given room to finish first. A client that re-associates on a lease it
@@ -36,7 +44,11 @@ constexpr uint32_t kNaptLeaseGraceMs = 8000;
 // this is roughly three minutes of a path that carries no packets.
 constexpr uint8_t kUplinkFailStreak = 3;
 constexpr uint8_t kClientFailStreak = 3;
-constexpr uint32_t kBackoffMaxMs = 60000;
+// Capped low on purpose. Exponential backoff to a minute assumes repeated failure
+// means a persistent outage; here it usually means one campus AP refused us, and the
+// next attempt a few seconds later succeeds. Backing off to 60 s turned a transient
+// refusal into a minute of downtime for no benefit.
+constexpr uint32_t kBackoffMaxMs = 15000;
 
 uint32_t backoffMs = kBackoffInitialMs;
 uint32_t reconnectAtMs = 0;
@@ -50,6 +62,13 @@ bool uplinkReady = false;
 // still running and WiFi.begin() silently did nothing at all.
 bool attemptActive = false;
 uint32_t attemptStartedMs = 0;
+
+// Set when the current attempt reaches association, cleared when it drops again.
+// While associated the driver is genuinely mid-handshake — EAP and DHCP still have
+// work to do — so only the hard deadline applies; the quiet rule would abort a
+// connection about to succeed.
+bool attemptAssociated = false;
+uint32_t lastDisconnectMs = 0;
 
 // Downstream client tracking. clientIp is the address handed out by DHCP, kept so
 // the downstream probe has something to aim at; it survives the client leaving so
@@ -164,6 +183,8 @@ void runScan() {
 void startAttempt() {
   attemptActive = true;
   attemptStartedMs = millis();
+  attemptAssociated = false;
+  lastDisconnectMs = 0;
   uplink::begin();
 }
 
@@ -216,6 +237,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       logLine("STA associated with uplink AP");
+      attemptAssociated = true;
       break;
 
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
@@ -249,6 +271,8 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       // connection that was still being set up, where WiFi.begin() is refused
       // outright and the backoff doubles for an attempt never actually made.
       // An attempt that genuinely gets nowhere is caught by kAttemptTimeoutMs.
+      attemptAssociated = false;
+      lastDisconnectMs = millis();
       if (!attemptActive) {
         scheduleReconnect();
       }
@@ -455,10 +479,17 @@ void loop() {
   // Abandon an attempt that has run past its deadline without producing an IP,
   // and fall into the normal backoff. This is what bounds a connect that the
   // driver never resolves either way.
-  if (attemptActive && millis() - attemptStartedMs >= kAttemptTimeoutMs) {
-    attemptActive = false;
-    logLine("STA attempt timed out");
-    scheduleReconnect();
+  if (attemptActive) {
+    bool hardTimeout = millis() - attemptStartedMs >= kAttemptTimeoutMs;
+    // The driver has disconnected and then gone quiet without associating, so it has
+    // exhausted the BSSIDs behind this SSID. Retry now rather than sitting out the
+    // rest of the deadline.
+    bool gaveUp = !attemptAssociated && lastDisconnectMs != 0 && millis() - lastDisconnectMs >= kAttemptQuietMs;
+    if (hardTimeout || gaveUp) {
+      attemptActive = false;
+      logLine(hardTimeout ? "STA attempt timed out" : "STA attempt failed (driver out of candidates)");
+      scheduleReconnect();
+    }
   }
 
   if (reconnectPending && millis() >= reconnectAtMs) {
