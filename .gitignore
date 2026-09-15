@@ -8,3 +8,7 @@
 compile_commands.json
 
 src/secrets.h
+
+# PlatformIO rewrites src/idf_component.yml during the build and leaves this
+# backup behind. It is a build artifact, not a source file.
+src/idf_component.yml.orig
