@@ -60,6 +60,9 @@ uint32_t attemptStartedMs = 0;
 // of lock acquisitions a second, contending with the very WiFi task that forwards
 // NAT traffic — measurably slower throughput for information that changes at human
 // speed. Sampled at 2 Hz instead, and read from cache everywhere in the hot path.
+// Heartbeat cadence when nothing is changing. See the heartbeat block in loop().
+constexpr uint32_t kIdleBeatMs = 600000;
+
 constexpr uint32_t kRadioPollMs = 500;
 uint8_t radioStations = 0;
 int32_t radioChannel = 0;
@@ -268,6 +271,11 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       if (WiFi.softAPgetStationNum() == 0) {
         leaseSeen = false;
         lastApAssocMs = 0;
+        // Forget the address too. Probing an address nobody holds fails forever,
+        // and the downstream recovery below reads that as a wedged client and
+        // deauths — which, if a client is mid-DHCP at the time, kicks it off during
+        // the exchange it needs to complete to become reachable at all.
+        clientIp = IPAddress((uint32_t)0);
       }
       break;
 
@@ -322,7 +330,11 @@ void loop() {
 
   // Probe both directions. Non-blocking: lwIP's ping task does the work and this
   // only starts rounds and collects results.
-  health::update(uplinkReady, WiFi.gatewayIP(), clientIp);
+  // Downstream is probed only while a client is associated and holding a lease we
+  // have seen. Outside that, there is nothing meaningful to ask and a failed answer
+  // would mean nothing.
+  bool clientProbeable = radioStations > 0 && leaseSeen;
+  health::update(uplinkReady, WiFi.gatewayIP(), clientProbeable ? clientIp : IPAddress((uint32_t)0));
 
   // An uplink that holds an IP but answers nothing is worse than one that is
   // plainly down: every status signal reads healthy while no traffic moves. Tear
@@ -341,7 +353,7 @@ void loop() {
   // client's link is wedged, and the only lever we have is to push it off so it
   // re-associates. Also gated on it having answered before, so a client that never
   // replies to ICMP is never deauthed on suspicion.
-  if (health::downstreamEverOk() && health::downstreamFailStreak() >= kClientFailStreak) {
+  if (clientProbeable && health::downstreamEverOk() && health::downstreamFailStreak() >= kClientFailStreak) {
     logLine("RECOVERY: client unreachable — deauthing to force re-association");
     health::resetStreaks();
     esp_wifi_deauth_sta(0);  // 0 = every associated station
@@ -365,13 +377,22 @@ void loop() {
   // indistinguishable from a hung one. "Amber and silent" reads as a crash even
   // when the only thing happening is that no client has joined yet, so the
   // production build emits one line every 30 s saying so.
+  // Printed the moment anything changes, and otherwise only every ten minutes.
+  // At one line per 30 s a 96-line ring held barely 45 minutes, so an overnight
+  // fault had scrolled out of the portal log long before anyone read it. RSSI is
+  // excluded from the comparison because it moves constantly and would defeat the
+  // suppression entirely; it is still printed.
   static uint32_t lastBeatMs = 0;
-  if (lastBeatMs == 0 || millis() - lastBeatMs >= 30000) {
+  static char lastBeat[96] = "";
+  char beat[96];
+  snprintf(
+    beat, sizeof(beat), "uplink=%s ch=%d clients=%u napt=%d health up=%s down=%s", uplinkReady ? "up" : "down", channel, radioStations,
+    napt::isEnabled(), healthName(health::upstream()), healthName(health::downstream())
+  );
+  if (lastBeatMs == 0 || strcmp(beat, lastBeat) != 0 || millis() - lastBeatMs >= kIdleBeatMs) {
     lastBeatMs = millis();
-    logbuf::printf(
-      "[%10lu] uplink=%s ch=%d rssi=%d clients=%u napt=%d health up=%s down=%s\n", millis(), uplinkReady ? "up" : "down", channel, WiFi.RSSI(),
-      radioStations, napt::isEnabled(), healthName(health::upstream()), healthName(health::downstream())
-    );
+    strncpy(lastBeat, beat, sizeof(lastBeat) - 1);
+    logbuf::printf("[%10lu] %s rssi=%d\n", millis(), beat, WiFi.RSSI());
   }
 #endif
 

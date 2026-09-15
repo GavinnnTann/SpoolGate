@@ -14,9 +14,10 @@
 // through Serial.printf.
 namespace logbuf {
 
-// Lines retained. At roughly one line per state change plus a heartbeat every
-// 30 s, this is a comfortable window over the last several minutes.
-constexpr size_t kLines = 64;
+// Lines retained. With the heartbeat suppressed while nothing changes, 96 lines
+// spans well over a day of steady running — enough that a fault which happened
+// overnight is still on the page the next morning.
+constexpr size_t kLines = 96;
 constexpr size_t kLineLen = 128;
 
 // Installs the framework log hook. Call once, after Serial.begin().
