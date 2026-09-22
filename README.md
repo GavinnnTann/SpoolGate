@@ -88,9 +88,11 @@ DNS server, so cloud connectivity and discovery work again.
   the header of [`platformio.ini`](platformio.ini).
 - **2.4 GHz only, both sides.** Bambu printers have no 5 GHz radio, and the ESP32
   SoftAP is forced onto the STA uplink's channel (a single-radio hardware constraint).
-- **Throughput ceiling ~10–15 Mbps** — one half-duplex radio shared between both links
-  plus software NAT. Plenty for gcode upload and MQTT cloud/LAN control; not for the
-  cloud camera stream (disable that on the printer).
+- **Throughput ceiling ~5–15 Mbps** — one half-duplex radio shared between both links
+  plus software NAT, so a forwarded packet crosses the same radio twice. Plenty for
+  gcode upload and MQTT cloud/LAN control. The camera stream is the marginal case, and
+  usually for latency and loss rather than for bandwidth — measure before assuming
+  either way ([`docs/THROUGHPUT.md`](docs/THROUGHPUT.md)).
 
 ## Quick start
 
@@ -130,6 +132,9 @@ credentials or settings. Connect a device to the SoftAP and browse to the AP add
 - **Save & reboot** persists settings to NVS flash and restarts to apply. Once saved,
   **NVS is the source of truth** — `secrets.h` only seeds a factory-fresh device, so
   editing it later has no effect unless you factory-reset.
+- **View log** shows the in-memory log ring, and **Speed test** measures the
+  downstream Wi-Fi link from the browser — see
+  [Measuring throughput](#measuring-throughput).
 
 Security: the portal is served **only to clients on the private SoftAP subnet** —
 every request from off-subnet (i.e. the upstream network) is rejected, so the admin
@@ -151,6 +156,38 @@ the router is diagnosable once deployed without a serial cable:
 | **Blue** flashing | Upstream connected **and** a downstream device joined |
 | Solid magenta | Fault — SoftAP failed to start (should not happen) |
 
+## Measuring throughput
+
+Two tests, because "is the radio link healthy" and "how fast is routed traffic" are
+different questions and one figure cannot answer both.
+
+**The downstream link** — in the portal, **Settings → Speed test**. No setup and no
+second machine: it streams filler from the ESP32 to your browser and measures one hop,
+this radio to this client. Always reads higher than routed traffic, because a
+forwarded packet crosses the same radio twice. Use it as a floor check and to see the
+client's signal strength as the router hears it.
+
+**The end-to-end path** — [`tools/speedtest.ps1`](tools/speedtest.ps1), run from a
+laptop. Measures download and upload throughput, an idle latency ladder across all
+three hops, **latency under load**, and the router's own state before and after.
+Requires no server of your own; optionally drives `iperf3` if you have one reachable.
+
+```powershell
+.\tools\speedtest.ps1 -Label through-spoolgate      # joined to the SoftAP
+.\tools\speedtest.ps1 -Label campus-direct          # joined to the upstream Wi-Fi
+.\tools\speedtest.ps1 -Compare .\results\speedtest-through-spoolgate-*.json,.\results\speedtest-campus-direct-*.json
+```
+
+Run both from the same spot and diff them — that difference is the only number that
+says what the ESP32 actually costs you, since a single reading cannot tell a slow
+router from a slow campus network.
+
+[`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the expected ranges, a
+symptom-to-cause table, and what all of this means for the camera stream
+specifically — short version: the A1 mini's Live View needs only 1–3 Mbit/s, so if
+routed throughput comes back above ~4 Mbit/s the problem is latency or loss, not
+bandwidth.
+
 ## Firmware structure
 
 ```
@@ -165,6 +202,8 @@ src/
   nat_debug.h         NAT_DEBUG compile switch for the diagnostics
   secrets.h(.example) factory-default credentials
 docs/NOTES.md         build-environment, board, and platform gotchas
+docs/THROUGHPUT.md    how to measure the link, and how to read the result
+tools/speedtest.ps1   end-to-end throughput, latency and loss, from a laptop
 ```
 
 Two non-obvious behaviours are load-bearing, hard-won, and documented in the code —
