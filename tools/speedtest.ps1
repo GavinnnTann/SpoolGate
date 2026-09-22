@@ -306,9 +306,19 @@ function Invoke-LoadedTransfer($curlArgs, $writeOut, $pingTarget, $maxSeconds) {
         bytes     = $bytes
         mbps      = [math]::Round(([double]$parts[2]) * 8.0 / 1e6, 2)
         seconds   = [math]::Round([double]$parts[3], 2)
-        # 100 KB, not 1 byte: an error page has a body too, and it would otherwise be
-        # scored as a successful transfer at a hilarious rate.
-        ok        = ($code -eq 200 -and $bytes -gt 100000)
+        # An upload cut short by --max-time has no final status yet, because the
+        # server only answers once the body is complete. curl reports 100 for it -
+        # it sends Expect: 100-continue for a large POST and the Continue is the only
+        # status it has received - or 000 if nothing came back at all. Both are good
+        # measurements of a slow path, and rejecting them is what made a perfectly
+        # valid upload reading show up as a blank in the comparison table.
+        #
+        # So: anything up to and including 200, gated on bytes actually moved. The
+        # floor does the real work - a connection that never established cannot have
+        # pushed 100 KB, and an error body is far smaller than that. It also catches
+        # one fallback mirror that answers 200 with a 25-byte stub, which would
+        # otherwise be scored as a real transfer at a hilarious rate.
+        ok        = (($bytes -gt 100000) -and ($code -le 200))
         # True when the data ran out before the clock did. The rate is still valid;
         # the latency sample just covers less than the full window.
         completed = ([double]$parts[3] -lt $maxSeconds)
@@ -339,13 +349,22 @@ function Invoke-TransferWithRetry($curlArgs, $writeOut, $pingTarget, $seconds) {
 }
 
 function Show-TransferFailure($t) {
-  if (-not $t -or $t.http_code -eq 0) {
-    Write-Host '  FAILED - nothing came back. No route out of this network, or HTTPS is blocked here.' -ForegroundColor Red
+  if (-not $t) {
+    Write-Host '  FAILED - curl produced no result at all.' -ForegroundColor Red
     return
   }
   if ($t.http_code -eq 429) {
     Write-Host '  FAILED - HTTP 429, the endpoint is still rate-limiting this machine.' -ForegroundColor Red
     Write-Host '  Leave it a few minutes before the next run. This is not the router.' -ForegroundColor DarkGray
+    return
+  }
+  if ($t.http_code -le 200) {
+    Write-Host ('  FAILED - only {0} bytes moved in {1} s (status {2}).' -f $t.bytes, $t.seconds, $t.http_code) -ForegroundColor Red
+    if ($t.bytes -lt 1000) {
+      Write-Host '  Nothing moved: no route out of this network, or HTTPS is blocked here.' -ForegroundColor DarkGray
+    } else {
+      Write-Host '  Too little to measure - the path is extremely slow, or losing most packets.' -ForegroundColor DarkGray
+    }
     return
   }
   Write-Host ('  FAILED - HTTP {0} after {1} bytes.' -f $t.http_code, $t.bytes) -ForegroundColor Red
