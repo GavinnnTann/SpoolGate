@@ -4,9 +4,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_random.h>
+#include <esp_wifi.h>
 
 #include "../config.h"
 #include "../logbuf.h"
+#include "../net/health.h"
 #include "../net/napt.h"
 #include "../watchdog.h"
 
@@ -23,6 +25,31 @@ uint32_t g_sessionExpiryMs = 0;
 constexpr uint32_t kSessionTtlMs = 15UL * 60UL * 1000UL;  // 15 min inactivity
 
 uint32_t g_rebootAtMs = 0;  // non-zero once a save has scheduled a reboot
+
+// ---- Throughput test constants ------------------------------------------------
+
+// Bytes per write in /speed/down. 4 KiB is large enough that the loop spends its
+// time in the radio rather than in per-call overhead, and small enough that a
+// client which walks away is noticed within one write.
+constexpr size_t kSpeedBlockBytes = 4096;
+
+// Size of one run, and the hard ceiling on both size and duration. The caps exist
+// because the run blocks loop() from start to finish: NAPT reconciliation, the
+// health probes, the channel-change watch and the status LED all stop until it
+// returns. That is harmless for a few seconds — the loop watchdog only acts after
+// five minutes — but it must not be open-ended, and a caller supplying ?mb= must
+// not be able to make it so.
+constexpr uint32_t kSpeedDefaultMiB = 8;
+constexpr uint32_t kSpeedMaxMiB = 64;
+constexpr uint32_t kSpeedMaxMs = 20000;
+
+// Last run as the router measured it, surfaced in /stat.json. The client's own
+// figure is the one to trust — it includes the air time of the final packets, which
+// the router counts as sent the moment lwIP accepts them — but a wide disagreement
+// between the two is itself the diagnosis: the router reporting 20 Mbit/s while the
+// browser sees 3 means the bytes left here and died on the air.
+uint32_t g_speedBytes = 0;
+uint32_t g_speedMs = 0;
 
 // ---- HTML ---------------------------------------------------------------------
 
@@ -369,6 +396,7 @@ void appendConfigForm(String &p, const char *msgHtml) {
 
   p += F("<button type=submit>Save &amp; reboot</button></form>");
   p += F("<a href=/log><button class=alt type=button>View log</button></a>");
+  p += F("<a href=/speed><button class=alt type=button>Speed test</button></a>");
   p += F("<form method=post action=/logout><button class=alt type=submit>Sign out</button></form>");
 
   p += F("<script>"
@@ -540,6 +568,228 @@ void handleLog() {
   server.send(200, "text/html", p);
 }
 
+// ---- Throughput test ----------------------------------------------------------
+
+// RSSI of the associated client as this radio hears it: the printer's signal at
+// *this* end of the link. No WiFi.softAP* call exposes it, and without it a stream
+// that breaks up is indistinguishable between "the downstream radio link is
+// marginal" and "NAT forwarding can't keep up" — which have nothing in common as
+// fixes. Returns 0 when nothing is associated.
+int8_t clientRssi() {
+  wifi_sta_list_t list = {};
+  if (esp_wifi_ap_get_sta_list(&list) != ESP_OK || list.num <= 0) {
+    return 0;
+  }
+  int8_t best = -127;
+  for (int i = 0; i < list.num; ++i) {
+    if (list.sta[i].rssi > best) {
+      best = list.sta[i].rssi;
+    }
+  }
+  return best;
+}
+
+const char *healthJson(health::Result r) {
+  switch (r) {
+    case health::Result::Ok:     return "\"ok\"";
+    case health::Result::Failed: return "\"fail\"";
+    default:                     return "\"unknown\"";
+  }
+}
+
+// Machine-readable snapshot of router-side state, for sampling while a throughput
+// test runs on a laptop (tools/speedtest.ps1 polls it once a second). The heap
+// figures are the reason it exists: the Wi-Fi driver's transmit buffers come out of
+// the same heap, so a forwarding path that stalls under load shows up here as the
+// free-heap low-water mark collapsing, which is invisible from the client end.
+//
+// Deliberately NOT behind the session login, unlike every other handler here. It
+// carries no credentials, no SSIDs and nothing an attacker on the private /24 could
+// not measure anyway, and gating it would mean every script that wants to correlate
+// a throughput dip with router state has to carry the admin password. It is still
+// refused off-LAN, which is the boundary that actually matters.
+void handleStatJson() {
+  if (!guard(/*requireAuth=*/false)) {
+    return;
+  }
+  bool up = WiFi.status() == WL_CONNECTED;
+
+  String j;
+  j.reserve(400);
+  j += F("{\"uptime_s\":");
+  j += String(millis() / 1000);
+  j += F(",\"uplink\":");
+  j += up ? "true" : "false";
+  j += F(",\"napt\":");
+  j += napt::isEnabled() ? "true" : "false";
+  j += F(",\"channel\":");
+  j += String(WiFi.channel());
+  j += F(",\"sta_rssi\":");
+  j += String(up ? WiFi.RSSI() : 0);
+  j += F(",\"clients\":");
+  j += String(WiFi.softAPgetStationNum());
+  j += F(",\"client_rssi\":");
+  j += String(clientRssi());
+  j += F(",\"health_up\":");
+  j += healthJson(health::upstream());
+  j += F(",\"health_down\":");
+  j += healthJson(health::downstream());
+  j += F(",\"heap_free\":");
+  j += String(ESP.getFreeHeap());
+  j += F(",\"heap_min\":");
+  j += String(ESP.getMinFreeHeap());
+  j += F(",\"heap_largest_block\":");
+  j += String(ESP.getMaxAllocHeap());
+  j += F(",\"aplink_bytes\":");
+  j += String(g_speedBytes);
+  j += F(",\"aplink_ms\":");
+  j += String(g_speedMs);
+  j += F("}");
+
+  noStore();
+  server.send(200, "application/json", j);
+}
+
+// Streams filler to the requesting client as fast as the SoftAP link will take it.
+//
+// This measures ONE hop — this radio to this client — and not the NAT path. That is
+// the point of it: it separates "the downstream Wi-Fi link is slow" from
+// "forwarding is slow", which look identical from the printer. A NAT'd flow can
+// never beat about half of what this reports, because the single radio has to
+// receive each packet on the STA link and re-send it on the AP link, on the same
+// channel, out of the same air-time budget.
+//
+// Chunked rather than a declared Content-Length, so the deadline below can end a
+// run early without the client seeing a truncated response. The client counts and
+// times the bytes it actually received; the figure logged here is the router's own
+// view of the same run.
+void handleSpeedDown() {
+  if (!guard(/*requireAuth=*/true)) {
+    return;
+  }
+
+  long mb = server.arg("mb").toInt();
+  if (mb <= 0) {
+    mb = kSpeedDefaultMiB;
+  } else if (mb > (long)kSpeedMaxMiB) {
+    mb = kSpeedMaxMiB;
+  }
+  const uint32_t target = (uint32_t)mb * 1024UL * 1024UL;
+
+  // Heap rather than a local. loopTask's stack is 8 KiB and a 4 KiB frame on it is
+  // not worth the risk for a buffer that only lives for the length of the run.
+  char *block = (char *)malloc(kSpeedBlockBytes);
+  if (block == nullptr) {
+    server.send(503, "text/plain", "Out of memory for the test buffer.");
+    return;
+  }
+  memset(block, 'x', kSpeedBlockBytes);
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  noStore();
+  server.send(200, "application/octet-stream", "");
+
+  uint32_t sent = 0;
+  const uint32_t startMs = millis();
+  while (sent < target && millis() - startMs < kSpeedMaxMs) {
+    // Checked every block so a client that closes the tab mid-run ends the test
+    // within one write rather than sitting out the whole deadline blocking loop().
+    if (!server.client().connected()) {
+      break;
+    }
+    server.sendContent(block, kSpeedBlockBytes);
+    sent += kSpeedBlockBytes;
+  }
+  const uint32_t elapsedMs = millis() - startMs;
+  server.sendContent("");  // zero-length chunk: terminates the chunked response
+  free(block);
+
+  g_speedBytes = sent;
+  g_speedMs = elapsedMs;
+  // bytes * 8 / milliseconds is bits per millisecond, which is kbit/s exactly.
+  logbuf::printf(
+    "[%10lu] speedtest: AP link sent %lu KiB in %lu ms = %lu kbit/s (client rssi %d dBm)\n", millis(), (unsigned long)(sent / 1024),
+    (unsigned long)elapsedMs, (unsigned long)(elapsedMs > 0 ? (uint32_t)((uint64_t)sent * 8ULL / elapsedMs) : 0), clientRssi()
+  );
+}
+
+void handleSpeedPage() {
+  if (!guard(/*requireAuth=*/true)) {
+    return;
+  }
+  String p = pageHead("SpoolGate — Speed test");
+  p += F("<h1>SpoolGate</h1><p class=sub>Downstream link speed test</p>");
+  p += F("<a href=/><button class=alt type=button>Back to settings</button></a>");
+
+  p += F("<div class=tabs>"
+         "<button type=button class=tab onclick=\"run(4)\">4 MiB</button>"
+         "<button type=button class=tab onclick=\"run(16)\">16 MiB</button>"
+         "<button type=button class=tab onclick=\"run(64)\">64 MiB</button>"
+         "</div>");
+  p += F("<p class=big id=res>idle</p>");
+  p += F("<p class=hint>One hop only: this router's radio to the device you are "
+         "reading this on. It is the ceiling for the downstream Wi-Fi link, not the "
+         "speed of NAT-routed traffic &mdash; a forwarded packet crosses the same "
+         "radio twice, so routed traffic gets at best about half of this. For the "
+         "end-to-end figure run <code>tools/speedtest.ps1</code> from a laptop "
+         "joined to this network.</p>");
+
+  p += F("<h2>Router state</h2><div id=stat>loading&hellip;</div>");
+  p += F("<p class=hint>Min free heap is a low-water mark since boot, so it only "
+         "ever falls. If a run drives it down sharply, the Wi-Fi driver is running "
+         "out of transmit buffers &mdash; that is a throughput ceiling no amount of "
+         "signal will lift.</p>");
+
+  p += F("<script>"
+         "var busy=0;"
+         "function row(k,v){return '<div class=kv><span>'+k+'</span><b>'+v+'</b></div>'}"
+         "function stat(){"
+         "fetch('/stat.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){"
+         "var h='';"
+         "h+=row('Uplink',d.uplink?'up':'down');"
+         "h+=row('Channel',d.channel);"
+         "h+=row('Uplink signal',d.sta_rssi+' dBm');"
+         "h+=row('Clients joined',d.clients);"
+         "h+=row('Client signal',d.client_rssi?d.client_rssi+' dBm':'n/a');"
+         "h+=row('NAPT',d.napt?'on':'off');"
+         "h+=row('Gateway reachable',d.health_up);"
+         "h+=row('Client reachable',d.health_down);"
+         "h+=row('Free heap',Math.round(d.heap_free/1024)+' KiB');"
+         "h+=row('Min free heap since boot',Math.round(d.heap_min/1024)+' KiB');"
+         "h+=row('Largest free block',Math.round(d.heap_largest_block/1024)+' KiB');"
+         "h+=row('Last run, router side',d.aplink_ms?(d.aplink_bytes/125/d.aplink_ms).toFixed(2)+' Mbit/s':'none yet');"
+         "document.getElementById('stat').innerHTML=h;"
+         "}).catch(function(){document.getElementById('stat').textContent='unreachable'})}"
+         // The clock starts on the first chunk, not on fetch(), so TCP setup and the
+         // router's own malloc are excluded and what is left is transfer time.
+         "function run(mb){"
+         "if(busy){return}busy=1;"
+         "var out=document.getElementById('res');"
+         "out.textContent='running '+mb+' MiB\\u2026';"
+         "var t0=0,got=0;"
+         "fetch('/speed/down?mb='+mb+'&t='+Date.now(),{cache:'no-store'}).then(function(r){"
+         "if(!r.ok){throw new Error('HTTP '+r.status)}"
+         "var rd=r.body.getReader();"
+         "function pump(){return rd.read().then(function(c){"
+         "if(c.done){return}"
+         "if(!t0){t0=performance.now()}"
+         "got+=c.value.length;"
+         "var s=(performance.now()-t0)/1000;"
+         "if(s>0.3){out.textContent=(got/125000/s).toFixed(2)+' Mbit/s'}"
+         "return pump()})}"
+         "return pump()}).then(function(){"
+         "var s=(performance.now()-t0)/1000;"
+         "out.textContent=(got/125000/s).toFixed(2)+' Mbit/s \\u2014 '+(got/1048576).toFixed(1)"
+         "+' MiB in '+s.toFixed(1)+' s';"
+         "}).catch(function(e){out.textContent='failed: '+e.message})"
+         ".then(function(){busy=0;stat()})}"
+         "stat();"
+         "</script>");
+  p += kPageFoot;
+  noStore();
+  server.send(200, "text/html", p);
+}
+
 void handleNotFound() {
   if (!fromLan()) {
     server.send(403, "text/plain", "Forbidden");
@@ -561,6 +811,9 @@ void begin() {
   server.on("/logout", HTTP_POST, handleLogout);
   server.on("/log", HTTP_GET, handleLog);
   server.on("/log.txt", HTTP_GET, handleLogText);
+  server.on("/speed", HTTP_GET, handleSpeedPage);
+  server.on("/speed/down", HTTP_GET, handleSpeedDown);
+  server.on("/stat.json", HTTP_GET, handleStatJson);
   server.onNotFound(handleNotFound);
 
   server.begin();

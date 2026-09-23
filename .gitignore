@@ -12,3 +12,7 @@ src/secrets.h
 # PlatformIO rewrites src/idf_component.yml during the build and leaves this
 # backup behind. It is a build artifact, not a source file.
 src/idf_component.yml.orig
+
+# Measurement output from tools/speedtest.ps1. Readings from one person's Wi-Fi on
+# one afternoon, useful for comparing against each other and nothing else.
+results/
